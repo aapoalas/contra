@@ -43,7 +43,7 @@ impl<'a> Handle<'a> {
         Handle(index, Contravariant::new())
     }
 
-    pub fn get(self, arena: &Arena) -> &f64 {
+    pub fn get<'arena>(self, arena: &'arena Arena, _gc: NoGc<'a>) -> &'arena f64 {
         arena.0.get(self.0 as usize).as_ref().unwrap()
     }
 
@@ -72,7 +72,14 @@ impl<'gc> Gc<'gc> {
     pub fn reborrow(&mut self) -> Gc<'_> {
         Gc(Covariant::new())
     }
+
+    pub fn nogc(&self) -> NoGc<'_> {
+        NoGc(Covariant::new())
+    }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoGc<'a>(Covariant<'a>);
 
 #[cfg(test)]
 mod tests {
@@ -93,9 +100,10 @@ mod tests {
             let a = a.local();
             let b = b.local();
             gc.join(a);
-            gc.join(b);
+            // gc.join(b);
+            a.get(arena, gc.nogc());
             perform_gc(arena, gc.reborrow());
-            // a.get(arena);
+            // a.get(arena, gc.nogc());
             // b.get(arena);
             Err(Handle::new(arena, 1.235))
         }
@@ -109,10 +117,10 @@ mod tests {
             gc.join(handle);
             let result = inner(arena, handle, handle, gc.reborrow())?;
             // handle.get(arena);
-            gc.join(result);
-            let scoped_result = *result.get(arena);
+            // gc.join(result);
+            let scoped_result = *result.get(arena, gc.nogc());
             perform_gc(arena, gc.reborrow());
-            // result.get(arena);
+            // result.get(arena, gc.nogc());
             Ok(Handle::new(arena, scoped_result))
         }
 
