@@ -1,7 +1,7 @@
-use std::marker::PhantomData;
+use std::{collections::HashSet, marker::PhantomData};
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Covariant<'a>(PhantomData<fn() -> &'a ()>);
 impl Covariant<'_> {
     fn new() -> Self {
@@ -9,13 +9,24 @@ impl Covariant<'_> {
     }
 }
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Contravariant<'a>(PhantomData<fn(&'a ())>);
 impl Contravariant<'_> {
     fn new() -> Self {
         Self(PhantomData)
     }
 }
+
+impl<'a> Clone for Contravariant<'a>
+where
+    Self: 'a,
+{
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl<'a> Copy for Contravariant<'a> {}
 
 impl Default for Contravariant<'_> {
     fn default() -> Self {
@@ -24,73 +35,216 @@ impl Default for Contravariant<'_> {
 }
 
 #[derive(Debug)]
-pub struct Arena(Vec<f64>);
+enum ArenaHandle<'a> {
+    Value(f64),
+    Ref(Handle<'a>),
+}
 
-impl Arena {
-    pub fn new<'a>(capacity: usize) -> (Self, Gc<'a>) {
+#[derive(Debug)]
+pub struct Arena<'a> {
+    data: Vec<ArenaHandle<'a>>,
+    roots: Vec<Option<Handle<'a>>>,
+}
+
+impl<'a> Arena<'a> {
+    pub fn new(capacity: usize) -> (Self, Gc<'a>) {
+        let mut arena = Self {
+            data: Vec::with_capacity(capacity),
+            roots: Vec::with_capacity(8),
+        };
+        let root = arena.alloc(0.0);
+        arena.roots.push(Some(root));
         // SAFETY: created with Arena.
-        (Self(Vec::with_capacity(capacity)), unsafe { Gc::new() })
+        let gc = unsafe { Gc::new() };
+        (arena, gc)
+    }
+
+    pub fn alloc<'l>(&mut self, value: f64) -> Handle<'l>
+    where
+        'a: 'l,
+    {
+        let index = u32::try_from(self.data.len()).unwrap();
+        self.data.push(ArenaHandle::Value(value));
+        Handle::new(index)
+    }
+
+    pub fn store<'h>(&mut self, handle: Handle<'h>) -> Handle<'h>
+    where
+        'a: 'h,
+    {
+        let index = u32::try_from(self.data.len()).unwrap();
+        self.data.push(ArenaHandle::Ref(handle));
+        Handle::new(index)
+    }
+
+    pub fn gc<'gc>(&mut self, _gc: Gc<'gc>)
+    where
+        'a: 'gc,
+    {
+        let mut kept_handles = HashSet::with_capacity(self.data.len());
+        self.roots.iter().for_each(|handle| {
+            // SAFETY: we promise to keep these handles valid for this time.
+            let mut handle = handle.as_ref().map(|h| unsafe { h.copy() });
+            while let Some(h) = handle {
+                let result = self.data.get(h.0 as usize).and_then(|d| match d {
+                    ArenaHandle::Value(_) => None,
+                    ArenaHandle::Ref(handle) => Some(unsafe { handle.copy() }),
+                });
+                // SAFETY: we promise to keep these handles valid for this time.
+                kept_handles.insert(h);
+                handle = result;
+            }
+        });
+        let mut new_handles = kept_handles
+            .iter()
+            // SAFETY: we promise to keep these handles valid for this time.
+            .map(|h| unsafe { h.copy() })
+            .collect::<Vec<_>>();
+        let mut prev = 0;
+        while kept_handles.len() > prev {
+            prev = kept_handles.len();
+            new_handles.sort();
+            for handle in new_handles.iter() {
+                match handle.get(self) {
+                    // SAFETY: we promise to keep these handles valid for this time.
+                    ArenaHandle::Ref(d) => {
+                        kept_handles.insert(unsafe { d.copy() });
+                    }
+                    _ => {}
+                }
+            }
+            new_handles.clear();
+        }
+        let mut kept_handles = kept_handles.into_iter().enumerate().collect::<Vec<_>>();
+        kept_handles.sort();
+        eprintln!("Kept handles: {kept_handles:?}");
+        eprintln!("Data: {:?}", self.data);
+        let mut idx = 0u32;
+        self.data.retain_mut(|handle| {
+            let i = idx;
+            idx += 1;
+            if kept_handles
+                .binary_search_by_key(&i, |h| h.0 as u32)
+                .is_err()
+            {
+                return false;
+            }
+            if let ArenaHandle::Ref(target) = handle {
+                let target_index = kept_handles
+                    .binary_search_by_key(&target.0, |h| h.0 as u32)
+                    .unwrap() as u32;
+                *target = Handle::new(target_index);
+            }
+            true
+        });
+        self.roots.iter_mut().for_each(|handle| {
+            if let Some(target) = handle {
+                eprintln!("Target handle: {target:?}");
+                let target_index = kept_handles
+                    .binary_search_by_key(&target.0, |h| h.0 as u32)
+                    .unwrap() as u32;
+                *target = Handle::new(target_index);
+            }
+        });
+        eprintln!("Data: {:?}", self.data);
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Handle<'a>(u32, Contravariant<'a>);
 
 impl<'a> Handle<'a> {
-    pub fn new(arena: &mut Arena, value: f64, gc: Gc<'a>) -> Handle<'a> {
-        let index = u32::try_from(arena.0.len()).unwrap();
-        arena.0.push(value);
+    fn new(index: u32) -> Handle<'a> {
         Handle(index, Contravariant::new())
     }
 
-    pub fn scope(self, arena: &mut Arena, gc: NoGc<'a>) -> Scoped {
-        let data = *self.get(arena, gc);
-        Scoped { data }
+    pub fn scope<'ar>(self, arena: &mut Arena<'ar>) -> Global<'ar>
+    where
+        'ar: 'a,
+    {
+        let index = arena.roots.len();
+        arena.roots.push(Some(self));
+        Global {
+            index: index as u32,
+            _marker: Contravariant::new(),
+        }
     }
 
-    pub fn internal_set(
-        self,
-        arena: &mut Arena,
-        p: Self,
-        v: Self,
-        o: Self,
-        gc: Gc<'a>,
-    ) -> Result<bool, Self> {
-        Ok(true)
+    pub fn set_value(&self, arena: &mut Arena<'a>, value: f64) {
+        let contents = self.get_mut(arena);
+        *contents = ArenaHandle::Value(value)
     }
 
-    pub fn asd(self, _gc: NoGc<'a>) -> u32 {
-        0
+    pub fn set_handle(&self, arena: &mut Arena<'a>, handle: Handle<'a>) {
+        let contents = self.get_mut(arena);
+        *contents = ArenaHandle::Ref(handle)
     }
 
-    pub fn thing(self) -> u32 {
-        0
+    // pub fn internal_set(
+    //     self,
+    //     arena: &mut Arena,
+    //     p: Self,
+    //     v: Self,
+    //     o: Self,
+    //     gc: Gc<'a>,
+    // ) -> Result<bool, Self> {
+    //     Ok(true)
+    // }
+
+    /// Test function to "safely" test compile-time invalidation of Handles.
+    pub fn test_usage(&self) {}
+
+    pub fn get_value<'arena>(&self, arena: &'arena Arena<'a>) -> &'arena f64 {
+        eprintln!("index: {}", self.0);
+        match arena.data.get(self.0 as usize).unwrap() {
+            ArenaHandle::Value(v) => v,
+            ArenaHandle::Ref(handle) => handle.get_value(arena),
+        }
     }
 
-    pub fn get<'arena>(self, arena: &'arena Arena, _gc: NoGc<'a>) -> &'arena f64 {
-        arena.0.get(self.0 as usize).as_ref().unwrap()
+    pub(crate) fn get<'arena>(&self, arena: &'arena Arena<'a>) -> &'arena ArenaHandle<'a> {
+        arena.data.get(self.0 as usize).unwrap()
     }
 
-    pub fn local<'l>(self) -> Handle<'l>
+    pub(crate) fn get_mut<'arena>(
+        &self,
+        arena: &'arena mut Arena<'a>,
+    ) -> &'arena mut ArenaHandle<'a> {
+        arena.data.get_mut(self.0 as usize).unwrap()
+    }
+
+    pub unsafe fn local<'l>(self) -> Handle<'l>
     where
         'a: 'l,
     {
         Handle(self.0, Contravariant::new())
     }
 
-    pub fn unbind(self) -> Handle<'static> {
+    pub unsafe fn copy<'l>(&self) -> Handle<'l>
+    where
+        'a: 'l,
+    {
         Handle(self.0, Contravariant::new())
     }
 }
 
-pub struct Scoped {
-    data: f64,
+pub struct Global<'a> {
+    index: u32,
+    _marker: Contravariant<'a>,
 }
 
-impl Scoped {
-    pub fn get<'a>(&self, arena: &mut Arena) -> Handle<'a> {
-        todo!()
-        // Handle::new(arena, self.data)
+impl<'a> Global<'a> {
+    pub fn get(&self, arena: &Arena<'a>) -> Handle<'a> {
+        // SAFETY: caller's problem, not mine.
+        unsafe { arena.roots[self.index as usize].as_ref().unwrap().copy() }
+    }
+
+    pub fn take<'l>(self, arena: &mut Arena) -> Handle<'l>
+    where
+        'a: 'l,
+    {
+        // SAFETY: caller's problem, not mine.
+        unsafe { arena.roots[self.index as usize].take().unwrap().local() }
     }
 }
 
@@ -105,14 +259,11 @@ impl<'gc> Gc<'gc> {
         Gc(Covariant::new())
     }
 
-    pub fn join<'a>(&'a self, _: Handle<'a>) {}
+    #[inline(always)]
+    pub fn join<'a>(&'a self, _: &Handle<'a>) {}
 
     pub fn reborrow(&mut self) -> Gc<'_> {
         Gc(Covariant::new())
-    }
-
-    pub fn nogc(&self) -> NoGc<'_> {
-        NoGc(Covariant::new())
     }
 
     pub fn into_nogc(self) -> NoGc<'gc> {
@@ -130,33 +281,65 @@ impl<'a> From<Gc<'a>> for NoGc<'a> {
 pub struct NoGc<'a>(Covariant<'a>);
 
 impl<'a> NoGc<'a> {
+    #[inline(always)]
     pub fn join(self, _: Handle<'a>) {}
+}
+
+#[macro_export]
+macro_rules! bind {
+    ($handle: ident, $gc: expr) => {
+        // SAFETY: immediately joined to Gc.
+        let $handle = unsafe { $handle.local() };
+        $gc.join(&$handle);
+    };
+    (let $handle: ident = $handle_creation: expr, $gc: expr) => {
+        let $handle = $handle_creation;
+        $gc.join(&$handle);
+    };
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Arena, Gc, Handle};
+    use crate::{Arena, Gc, Handle, bind};
 
     #[test]
     fn test_invalidation() {
-        fn invalidate<'a>(_: Gc<'a>, handle: Handle) -> &'a () {
-            todo!();
+        fn inner<'a: 'gc, 'gc>(
+            arena: &mut Arena<'a>,
+            handle: Handle<'gc>,
+            gc: Gc<'gc>,
+        ) -> Handle<'gc> {
+            bind!(handle, gc);
+            bind!(let handle = arena.store(handle), gc);
+            bind!(let handle = arena.store(handle), gc);
+            bind!(let handle = arena.alloc(0.123456), gc);
+            bind!(let handle = arena.store(handle), gc);
+            bind!(let handle = arena.store(handle), gc);
+            bind!(let handle = arena.store(handle), gc);
+            handle
         }
-        fn invalidate2<'a>(handle: Handle<'a>, _: Gc<'a>) {}
 
-        fn inner<'gc>(arena: &mut Arena, handle: Handle<'_>, gc: Gc<'gc>) {}
-
-        fn outer<'gc>(arena: &mut Arena, handle: Handle<'gc>, mut gc: Gc<'gc>) {
-            let bad_handle: Handle<'gc> = handle;
-            let handle = handle.local();
-            gc.join(handle);
-            let result = invalidate2(bad_handle, gc.reborrow());
-            bad_handle.thing();
-            println!("result");
+        fn outer<'a: 'gc, 'gc>(
+            arena: &mut Arena<'a>,
+            handle: Handle<'gc>,
+            mut gc: Gc<'gc>,
+        ) -> Handle<'gc> {
+            bind!(handle, gc);
+            handle.test_usage();
+            bind!(let result = inner(arena, handle, gc.reborrow()), gc);
+            bind!(let storage = arena.store(result), gc);
+            let bad_result = result;
+            eprintln!("Stored result: {}", storage.get_value(arena));
+            let storage = storage.scope(arena);
+            eprintln!("Stored result: {}", storage.get(arena).get_value(arena));
+            arena.gc(gc.reborrow());
+            bind!(let storage = storage.take(arena), gc);
+            eprintln!("Stored result: {}", storage.get_value(arena));
+            bad_result
         }
 
-        let (mut arena, mut gc) = Arena::new(256);
-        let handle = Handle::new(&mut arena, 1.0, gc.reborrow());
+        let (mut arena, gc) = Arena::new(256);
+        bind!(let handle = arena.alloc(1.235), gc);
         outer(&mut arena, handle, gc);
     }
 
